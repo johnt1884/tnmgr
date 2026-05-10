@@ -10,6 +10,10 @@ from datetime import datetime
 VIDEO_EXTENSIONS = ('.mp4', '.mkv', '.avi', '.mov', '.wmv', '.flv', '.webm')
 IMAGE_EXTENSIONS = ('.jpg', '.jpeg', '.png', '.webp', '.JPG', '.JPEG', '.PNG', '.WEBP')
 ROTATION_LUA_PATH = r"C:\Bridge\misc\tools\mpv-x86_64-v3-20260418-git-4377cce\portable_config\scripts\autorotate.lua"
+
+LANDSCAPE_TARGET_WIDTH = 342
+PORTRAIT_TARGET_WIDTH = 192
+TARGET_HEIGHT = 256
 FLIP_LUA_PATH = r"C:\Bridge\misc\tools\mpv-x86_64-v3-20260418-git-4377cce\portable_config\scripts\flip.lua"
 
 def get_projects(base_path):
@@ -97,6 +101,56 @@ def get_image_dimensions(image_path):
     except Exception:
         return 0, 0
 
+def get_crop_params(video_path, nb_frames):
+    """Detect crop parameters (removing black borders) using ffmpeg cropdetect."""
+    if nb_frames <= 0:
+        return None
+
+    # We'll take a few samples: 20%, 50%, 80%
+    samples = [int(nb_frames * 0.2), int(nb_frames * 0.5), int(nb_frames * 0.8)]
+    crops = []
+
+    for frame_idx in samples:
+        cmd = [
+            'ffmpeg', '-y', '-i', video_path,
+            '-vf', f"select='eq(n,{frame_idx})',cropdetect=limit=24:round=2",
+            '-frames:v', '1', '-f', 'null', '-'
+        ]
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+            match = re.search(r"crop=(\d+:\d+:\d+:\d+)", result.stderr)
+            if match:
+                crops.append(match.group(1))
+        except Exception:
+            continue
+
+    if not crops:
+        return None
+
+    # Return the most common one
+    return max(set(crops), key=crops.count)
+
+def has_black_borders(image_path):
+    """Check if an image has black borders using cropdetect."""
+    w_orig, h_orig = get_image_dimensions(image_path)
+    if w_orig == 0: return False
+
+    cmd = [
+        'ffmpeg', '-y', '-i', image_path,
+        '-vf', 'cropdetect=limit=24:round=2',
+        '-frames:v', '1', '-f', 'null', '-'
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+        match = re.search(r"crop=(\d+):(\d+):(\d+):(\d+)", result.stderr)
+        if match:
+            w, h, x, y = map(int, match.groups())
+            if w < w_orig or h < h_orig:
+                return True
+    except Exception:
+        pass
+    return False
+
 def generate_video_thumbnails(task):
     """Worker function using FFmpeg processes with dimension logic."""
     video_path, project_path, gen_main, missing_edits, *rest = task
@@ -152,24 +206,33 @@ def generate_video_thumbnails(task):
                         existing_images[i] = (edit_path, w, h)
                         break
 
+    # Detect crop parameters
+    crop_str = get_crop_params(video_path, nb_frames)
+    if crop_str:
+        # Extract width and height from crop_str "w:h:x:y"
+        cw, ch, cx, cy = map(int, crop_str.split(':'))
+        is_landscape = cw >= ch
+    else:
+        cw, ch = v_width, v_height
+        is_landscape = v_width >= v_height
+
     # Determine target dimensions for each missing slot
     target_dims = {} # slot_index -> (w, h)
     
     # Default targets if ALL images are missing
-    is_landscape = v_width >= v_height
     if is_landscape:
-        default_w, default_h = 384, 217
+        default_max_w, default_max_h = LANDSCAPE_TARGET_WIDTH, TARGET_HEIGHT
     else:
-        default_w, default_h = 217, 384
+        default_max_w, default_max_h = PORTRAIT_TARGET_WIDTH, TARGET_HEIGHT
 
     for slot in slots_to_generate:
         # Deep Scan fallback: if we are fixing wrong dimensions, use the ideal target
         if force_ideal:
-            if v_width > 0 and v_height > 0:
-                scale = min(default_w / v_width, default_h / v_height)
-                target_dims[slot] = (int(v_width * scale), int(v_height * scale))
+            if cw > 0 and ch > 0:
+                scale = min(default_max_w / cw, default_max_h / ch)
+                target_dims[slot] = (int(cw * scale), int(ch * scale))
             else:
-                target_dims[slot] = (default_w, default_h)
+                target_dims[slot] = (default_max_w, default_max_h)
             continue
 
         # Rule: Use dimensions of the preceding image present in the series
@@ -186,11 +249,11 @@ def generate_video_thumbnails(task):
                 # ALL missing: use target dimensions whilst maintaining aspect ratio
                 # We need to scale video dimensions to fit into default_w x default_h
                 # whilst keeping aspect ratio.
-                if v_width > 0 and v_height > 0:
-                    scale = min(default_w / v_width, default_h / v_height)
-                    target_dims[slot] = (int(v_width * scale), int(v_height * scale))
+                if cw > 0 and ch > 0:
+                    scale = min(default_max_w / cw, default_max_h / ch)
+                    target_dims[slot] = (int(cw * scale), int(ch * scale))
                 else:
-                    target_dims[slot] = (default_w, default_h)
+                    target_dims[slot] = (default_max_w, default_max_h)
             else:
                 # Some are present, but none preceding. 
                 # Requirement says "same dimensions as the preceeding images present"
@@ -210,8 +273,14 @@ def generate_video_thumbnails(task):
         for (tw, th), slots in groups.items():
             unique_frames = sorted(list(set(all_target_frames[s] for s in slots)))
             select_str = " + ".join([f"eq(n,{idx})" for idx in unique_frames])
-            # Use scale filter to match target dimensions
-            filter_graph = f"select='{select_str}',scale={tw}:{th},setpts=N/FRAME_RATE/TB"
+            # Use crop and scale filter to match target dimensions
+            filter_parts = [f"select='{select_str}'"]
+            if crop_str:
+                filter_parts.append(f"crop={crop_str}")
+            filter_parts.append(f"scale={tw}:{th}")
+            filter_parts.append("setpts=N/FRAME_RATE/TB")
+
+            filter_graph = ",".join(filter_parts)
             
             temp_pattern = os.path.join(project_path, f"tmp_{video_name}_{tw}_{th}_%d.jpg")
             cmd = [
@@ -253,17 +322,25 @@ def generate_video_thumbnails(task):
             if not os.path.exists(slot_10_path):
                 # Try to extract the very last possible frame
                 tw, th = target_dims[10]
+
+                # Build fallback filter
+                fallback_filter = []
+                if crop_str:
+                    fallback_filter.append(f"crop={crop_str}")
+                fallback_filter.append(f"scale={tw}:{th}")
+                fallback_filter_str = ",".join(fallback_filter)
+
                 # Using -sseof -1 allows seeking to 1 second before end
                 cmd_fallback = [
                     'ffmpeg', '-y', '-sseof', '-1', '-i', video_path,
-                    '-vf', f'scale={tw}:{th}', '-update', '1', '-frames:v', '1', '-q:v', '2',
+                    '-vf', fallback_filter_str, '-update', '1', '-frames:v', '1', '-q:v', '2',
                     slot_10_path
                 ]
                 if subprocess.run(cmd_fallback, capture_output=True).returncode != 0:
                     # If -sseof -1 fails (e.g. video < 1s), try without seeking
                     cmd_fallback_no_seek = [
                         'ffmpeg', '-y', '-i', video_path,
-                        '-vf', f'scale={tw}:{th}', '-frames:v', '1', '-q:v', '2',
+                        '-vf', fallback_filter_str, '-frames:v', '1', '-q:v', '2',
                         slot_10_path
                     ]
                     subprocess.run(cmd_fallback_no_seek, capture_output=True)
@@ -670,20 +747,33 @@ def run_normal_scan(deep_scan=False):
             if deep_scan:
                 nb_frames, fps, v_width, v_height = get_video_info(video)
                 if v_width > 0 and v_height > 0:
-                    is_landscape = v_width >= v_height
-                    default_w, default_h = (384, 217) if is_landscape else (217, 384)
-                    scale = min(default_w / v_width, default_h / v_height)
-                    target_w, target_h = int(v_width * scale), int(v_height * scale)
+                    crop_str = get_crop_params(video, nb_frames)
+                    if crop_str:
+                        cw, ch, cx, cy = map(int, crop_str.split(':'))
+                        is_landscape = cw >= ch
+                    else:
+                        cw, ch = v_width, v_height
+                        is_landscape = v_width >= v_height
+
+                    if is_landscape:
+                        default_max_w, default_max_h = LANDSCAPE_TARGET_WIDTH, TARGET_HEIGHT
+                    else:
+                        default_max_w, default_max_h = PORTRAIT_TARGET_WIDTH, TARGET_HEIGHT
+
+                    scale = min(default_max_w / cw, default_max_h / ch)
+                    target_w, target_h = int(cw * scale), int(ch * scale)
                     
                     if main_file:
-                        w, h = get_image_dimensions(os.path.join(thumb_dir, main_file))
-                        if w != target_w or h != target_h:
+                        main_path = os.path.join(thumb_dir, main_file)
+                        w, h = get_image_dimensions(main_path)
+                        if w != target_w or h != target_h or has_black_borders(main_path):
                             needs_main_fix = True
                             results['total_wrong_dimensions'] += 1
 
                     for i, f in zip(edit_indices, edit_files_found):
-                        w, h = get_image_dimensions(os.path.join(edit_dir, f))
-                        if w != target_w or h != target_h:
+                        edit_path = os.path.join(edit_dir, f)
+                        w, h = get_image_dimensions(edit_path)
+                        if w != target_w or h != target_h or has_black_borders(edit_path):
                             wrong_dim_edits.append(i)
                             results['total_wrong_dimensions'] += 1
 
