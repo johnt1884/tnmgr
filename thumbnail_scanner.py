@@ -10,6 +10,10 @@ from datetime import datetime
 VIDEO_EXTENSIONS = ('.mp4', '.mkv', '.avi', '.mov', '.wmv', '.flv', '.webm')
 IMAGE_EXTENSIONS = ('.jpg', '.jpeg', '.png', '.webp', '.JPG', '.JPEG', '.PNG', '.WEBP')
 ROTATION_LUA_PATH = r"C:\Bridge\misc\tools\mpv-x86_64-v3-20260418-git-4377cce\portable_config\scripts\autorotate.lua"
+
+LANDSCAPE_TARGET_WIDTH = 342
+PORTRAIT_TARGET_WIDTH = 192
+TARGET_HEIGHT = 256
 FLIP_LUA_PATH = r"C:\Bridge\misc\tools\mpv-x86_64-v3-20260418-git-4377cce\portable_config\scripts\flip.lua"
 
 def get_projects(base_path):
@@ -155,21 +159,23 @@ def generate_video_thumbnails(task):
     # Determine target dimensions for each missing slot
     target_dims = {} # slot_index -> (w, h)
     
-    # Default targets if ALL images are missing
+    cw, ch = v_width, v_height
     is_landscape = v_width >= v_height
+
+    # Default targets if ALL images are missing
     if is_landscape:
-        default_w, default_h = 384, 217
+        default_max_w, default_max_h = LANDSCAPE_TARGET_WIDTH, TARGET_HEIGHT
     else:
-        default_w, default_h = 217, 384
+        default_max_w, default_max_h = PORTRAIT_TARGET_WIDTH, TARGET_HEIGHT
 
     for slot in slots_to_generate:
         # Deep Scan fallback: if we are fixing wrong dimensions, use the ideal target
         if force_ideal:
-            if v_width > 0 and v_height > 0:
-                scale = min(default_w / v_width, default_h / v_height)
-                target_dims[slot] = (int(v_width * scale), int(v_height * scale))
+            if cw > 0 and ch > 0:
+                scale = min(default_max_w / cw, default_max_h / ch)
+                target_dims[slot] = (int(cw * scale), int(ch * scale))
             else:
-                target_dims[slot] = (default_w, default_h)
+                target_dims[slot] = (default_max_w, default_max_h)
             continue
 
         # Rule: Use dimensions of the preceding image present in the series
@@ -186,11 +192,11 @@ def generate_video_thumbnails(task):
                 # ALL missing: use target dimensions whilst maintaining aspect ratio
                 # We need to scale video dimensions to fit into default_w x default_h
                 # whilst keeping aspect ratio.
-                if v_width > 0 and v_height > 0:
-                    scale = min(default_w / v_width, default_h / v_height)
-                    target_dims[slot] = (int(v_width * scale), int(v_height * scale))
+                if cw > 0 and ch > 0:
+                    scale = min(default_max_w / cw, default_max_h / ch)
+                    target_dims[slot] = (int(cw * scale), int(ch * scale))
                 else:
-                    target_dims[slot] = (default_w, default_h)
+                    target_dims[slot] = (default_max_w, default_max_h)
             else:
                 # Some are present, but none preceding. 
                 # Requirement says "same dimensions as the preceeding images present"
@@ -670,19 +676,27 @@ def run_normal_scan(deep_scan=False):
             if deep_scan:
                 nb_frames, fps, v_width, v_height = get_video_info(video)
                 if v_width > 0 and v_height > 0:
+                    cw, ch = v_width, v_height
                     is_landscape = v_width >= v_height
-                    default_w, default_h = (384, 217) if is_landscape else (217, 384)
-                    scale = min(default_w / v_width, default_h / v_height)
-                    target_w, target_h = int(v_width * scale), int(v_height * scale)
+
+                    if is_landscape:
+                        default_max_w, default_max_h = LANDSCAPE_TARGET_WIDTH, TARGET_HEIGHT
+                    else:
+                        default_max_w, default_max_h = PORTRAIT_TARGET_WIDTH, TARGET_HEIGHT
+
+                    scale = min(default_max_w / cw, default_max_h / ch)
+                    target_w, target_h = int(cw * scale), int(ch * scale)
                     
                     if main_file:
-                        w, h = get_image_dimensions(os.path.join(thumb_dir, main_file))
+                        main_path = os.path.join(thumb_dir, main_file)
+                        w, h = get_image_dimensions(main_path)
                         if w != target_w or h != target_h:
                             needs_main_fix = True
                             results['total_wrong_dimensions'] += 1
 
                     for i, f in zip(edit_indices, edit_files_found):
-                        w, h = get_image_dimensions(os.path.join(edit_dir, f))
+                        edit_path = os.path.join(edit_dir, f)
+                        w, h = get_image_dimensions(edit_path)
                         if w != target_w or h != target_h:
                             wrong_dim_edits.append(i)
                             results['total_wrong_dimensions'] += 1
